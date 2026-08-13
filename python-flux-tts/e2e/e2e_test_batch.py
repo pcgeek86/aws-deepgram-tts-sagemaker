@@ -394,18 +394,46 @@ def sc_concurrent_5(rt, ep, voice):
     }
 
 
+# ORDER MATTERS, and not for the usual reasons. Every scenario whose request is
+# rejected BY STEM costs the endpoint one health trigger: stem publishes no NATS
+# usage payload for a request it refused, so the shim waits out its 200 ms grace
+# window, fails the request closed (5xx, "returned without metering emission") and
+# records an `http_nats_grace_window` trigger. THREE of those inside the rolling
+# window flip the endpoint to degraded — `/ping` goes 503, SageMaker stops routing,
+# and every scenario after that fails with a 424 that has nothing to do with what
+# it was testing.
+#
+# Measured 2026-08-13: adding expressivity_out_of_range + expressivity_fractional
+# took this battery from 2 stem-rejected requests to 4 and tripped exactly that.
+# concurrent_5 and the entire streaming battery that followed failed, which read
+# like a product regression and was not one.
+#
+# So: every stem-rejecting negative runs LAST, after everything that needs a
+# healthy endpoint. Degradation is recoverable, so paying for it at the very end
+# costs nothing — the negatives themselves still pass either way, since a
+# fail-closed 5xx and a clean stem 400 are both "rejected" as far as they assert.
+#
+# `unknown_param` is deliberately NOT in that group: the shim rejects an
+# off-allowlist param BEFORE proxying, so no NATS wait happens and it is free.
+#
+# If you run this battery and the streaming one back-to-back against ONE endpoint,
+# leave a recovery gap between them, or the streaming run inherits the degraded
+# state this battery's tail induces.
 SCENARIOS = {
+    # --- positives + load: need a healthy endpoint ---
     "basic": sc_basic,
     "long_text": sc_long_text,
     "speed": sc_speed,
-    "speed_out_of_range": sc_speed_out_of_range,
     "expressivity": sc_expressivity,
+    "wav_container": sc_wav_container,
+    "concurrent_5": sc_concurrent_5,
+    # --- free negative: rejected by the shim pre-proxy, no NATS wait ---
+    "unknown_param": sc_unknown_param,
+    # --- stem-rejecting negatives: each costs one degraded trigger, so LAST ---
+    "speed_out_of_range": sc_speed_out_of_range,
     "expressivity_out_of_range": sc_expressivity_out_of_range,
     "expressivity_fractional": sc_expressivity_fractional,
-    "wav_container": sc_wav_container,
-    "unknown_param": sc_unknown_param,
     "aura_model_rejected": sc_aura_model_rejected,
-    "concurrent_5": sc_concurrent_5,
 }
 
 

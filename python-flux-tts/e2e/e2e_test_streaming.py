@@ -539,11 +539,18 @@ SCENARIOS = {
     "long_turn": sc_long_turn,
     "speed": sc_speed,
     "expressivity": sc_expressivity,
-    "expressivity_out_of_range": sc_expressivity_out_of_range,
     "configure_speed": sc_configure_speed,
     "interrupt": sc_interrupt,
-    "unknown_param": sc_unknown_param,
     "concurrent_5": sc_concurrent_5,
+    # --- negatives LAST. A rejected request yields no NATS usage payload, so the
+    # shim fails it closed and records an `http_nats_grace_window` health trigger;
+    # three inside the rolling window flip the endpoint to degraded and every
+    # later scenario fails with an unrelated 424. Measured on the batch battery
+    # 2026-08-13, where two added negatives did exactly that. Ordering the
+    # negatives last makes the cost harmless, since nothing runs after them and
+    # they pass on either a clean rejection or a fail-closed one.
+    "unknown_param": sc_unknown_param,
+    "expressivity_out_of_range": sc_expressivity_out_of_range,
 }
 
 
