@@ -30,6 +30,10 @@ import boto3
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from e2e.e2e_test_common import (  # noqa: E402
+    EXPRESSIVITY_FRACTIONAL,
+    EXPRESSIVITY_MAX,
+    EXPRESSIVITY_MIN,
+    EXPRESSIVITY_OUT_OF_RANGE,
     LONG_TEXT,
     MAX_SPEED,
     REFERENCE_TEXT,
@@ -159,6 +163,132 @@ def sc_speed_out_of_range(rt, ep, voice):
     }
 
 
+def sc_expressivity(rt, ep, voice):
+    """`expressivity` must be ACCEPTED across its whole documented range.
+
+    This scenario exists because the param was *shipped broken*: `expressivity`
+    is a GA `/v2/speak` control that the container's stem fully implements, but it
+    was missing from the pricing catalog's `tts.known_params`, and
+    REJECT_UNKNOWN_PARAMS is on in every image — so the shim returned
+    400 `unsupported_parameter` before the request ever reached stem. Nothing
+    caught it because nothing tested it. This is that test.
+
+    Both ends of the range plus the default are exercised, since the failure mode
+    being guarded against is an allowlist/range mismatch rather than anything
+    audio-specific. Deliberately NOT asserted: that the audio sounds different
+    from the default. `expressivity` is Beta and non-default values raise the
+    hallucination risk, so "is it more animated" is not a stable gate — unlike
+    `speed`, whose effect on duration is directly measurable.
+    """
+    t0 = time.monotonic()
+    tried, failed = [], []
+    last_audio, last_meta = b"", {}
+    for value in (EXPRESSIVITY_MIN, 0, EXPRESSIVITY_MAX):
+        try:
+            audio, meta = invoke_batch(rt, ep, "Short expressivity probe.", voice, expressivity=value)
+            ok, note, _ = audio_verdict(audio, SAMPLE_RATE)
+            tried.append(f"{value}:{'ok' if ok else note}")
+            if not ok:
+                failed.append(str(value))
+            last_audio, last_meta = audio, meta
+        except Exception as e:  # noqa: BLE001
+            msg = str(e)
+            # Name the original bug explicitly: this is what a catalog missing
+            # `expressivity` looks like from the client side.
+            if "unsupported_parameter" in msg or "unsupported parameter" in msg.lower():
+                tried.append(f"{value}:REJECTED-as-unknown-param")
+            else:
+                tried.append(f"{value}:{type(e).__name__}")
+            failed.append(str(value))
+
+    row = _row("expressivity", last_audio, last_meta, t0)
+    row["ok"] = not failed
+    row["notes"] = (
+        f"accepted {EXPRESSIVITY_MIN}..{EXPRESSIVITY_MAX}: " + " ".join(tried)
+        if not failed
+        else f"failed for {','.join(failed)} — " + " ".join(tried)
+    )
+    return row
+
+
+def sc_expressivity_out_of_range(rt, ep, voice):
+    """NEGATIVE control — `expressivity` outside -2..2 must be rejected.
+
+    Documented as a 400 `EXPRESSIVITY_OUT_OF_RANGE`. Pinning the rejection is what
+    establishes the accepted range that `expressivity` above relies on; a server
+    that clamped instead would synthesize at a setting the caller never asked for.
+    """
+    t0 = time.monotonic()
+    rejected, detail = False, ""
+    try:
+        audio, _ = invoke_batch(
+            rt, ep, "Short probe.", voice, expressivity=EXPRESSIVITY_OUT_OF_RANGE
+        )
+        detail = (
+            f"ACCEPTED out-of-range expressivity={EXPRESSIVITY_OUT_OF_RANGE}, "
+            f"returned {len(audio)}B"
+        ) if audio else "empty body"
+        rejected = not audio
+    except Exception as e:  # noqa: BLE001
+        rejected = True
+        msg = str(e)
+        detail = "EXPRESSIVITY_OUT_OF_RANGE" if "OUT_OF_RANGE" in msg.upper() else f"{type(e).__name__}"
+    return {
+        "scenario": "expressivity_out_of_range",
+        "ok": rejected,
+        "notes": f"rejected as expected ({detail})" if rejected else detail,
+        "bytes": 0,
+        "duration_s": 0.0,
+        "rms": 0.0,
+        "billable_chars": "",
+        "elapsed_s": time.monotonic() - t0,
+    }
+
+
+def sc_expressivity_fractional(rt, ep, voice):
+    """NEGATIVE control — a FRACTIONAL `expressivity` must be rejected.
+
+    Separate from `expressivity_out_of_range` on purpose: 1.5 is numerically
+    *inside* -2..2, so it exercises a different validation path and a different
+    documented error (`EXPRESSIVITY_INCREMENT_INVALID`). stem parses the param as
+    `f64` rather than `i8` specifically so a fractional value reaches this check
+    instead of failing as an opaque deserialization error, which is a behavior
+    worth keeping honest.
+    """
+    t0 = time.monotonic()
+    rejected, detail = False, ""
+    try:
+        audio, _ = invoke_batch(
+            rt, ep, "Short probe.", voice, expressivity=EXPRESSIVITY_FRACTIONAL
+        )
+        detail = (
+            f"ACCEPTED fractional expressivity={EXPRESSIVITY_FRACTIONAL}, "
+            f"returned {len(audio)}B"
+        ) if audio else "empty body"
+        rejected = not audio
+    except Exception as e:  # noqa: BLE001
+        rejected = True
+        msg = str(e).upper()
+        if "INCREMENT_INVALID" in msg:
+            detail = "EXPRESSIVITY_INCREMENT_INVALID"
+        elif "OUT_OF_RANGE" in msg:
+            # Still a rejection, but via the wrong code — worth surfacing rather
+            # than hiding behind a green row.
+            detail = "rejected but as OUT_OF_RANGE, expected INCREMENT_INVALID"
+        else:
+            detail = f"{type(e).__name__}"
+    return {
+        "scenario": "expressivity_fractional",
+        "ok": rejected,
+        "notes": f"rejected as expected ({detail})" if rejected else detail,
+        "bytes": 0,
+        "duration_s": 0.0,
+        "rms": 0.0,
+        "billable_chars": "",
+        "elapsed_s": time.monotonic() - t0,
+    }
+
+
 def sc_wav_container(rt, ep, voice):
     """`container=wav` — a batch-only param (streaming rejects it), so this also
     confirms the batch query surface really is the batch one."""
@@ -269,6 +399,9 @@ SCENARIOS = {
     "long_text": sc_long_text,
     "speed": sc_speed,
     "speed_out_of_range": sc_speed_out_of_range,
+    "expressivity": sc_expressivity,
+    "expressivity_out_of_range": sc_expressivity_out_of_range,
+    "expressivity_fractional": sc_expressivity_fractional,
     "wav_container": sc_wav_container,
     "unknown_param": sc_unknown_param,
     "aura_model_rejected": sc_aura_model_rejected,

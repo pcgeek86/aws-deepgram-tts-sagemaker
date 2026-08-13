@@ -28,9 +28,18 @@ weak assertion for TTS:
   long_turn          a turn spanning many segments still ends with ONE
                      SpeechMetadata.
   speed              `speed` query param, a supported GA control. Renders the
-                     same text at the default rate and at speed=1.3 and requires
-                     the faster one to be measurably shorter — accepting the
-                     param but ignoring it would otherwise pass.
+                     same text at the default rate and at the fastest supported
+                     rate (1.15) and requires the faster one to be measurably
+                     shorter — accepting the param but ignoring it would
+                     otherwise pass. (1.15 is the ceiling; 1.3 is rejected.)
+  expressivity       `expressivity` query param (-2..2, GA, Beta behavior).
+                     Asserts each end of the range plus the default is ACCEPTED
+                     and yields non-silent audio. Exists because the param
+                     shipped missing from the pricing catalog's known_params, so
+                     the shim 400'd a documented feature the stem supports.
+  expressivity_out_of_range
+                     NEGATIVE control: expressivity=3 must be rejected, not
+                     clamped — this is what establishes the accepted range.
   configure_speed    mid-stream `Configure{speed}` must come back as
                      ConfigureSuccess and the following turn must still produce
                      audio.
@@ -55,6 +64,9 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from e2e.e2e_test_common import (  # noqa: E402
+    EXPRESSIVITY_MAX,
+    EXPRESSIVITY_MIN,
+    EXPRESSIVITY_OUT_OF_RANGE,
     LONG_TEXT,
     MAX_SPEED,
     REFERENCE_PHRASES,
@@ -243,6 +255,111 @@ async def sc_speed(client, ep, voice):
     return row
 
 
+async def sc_expressivity(client, ep, voice):
+    """`expressivity` must be ACCEPTED across its documented range on streaming too.
+
+    This exists because the param shipped BROKEN: `expressivity` is a GA
+    `/v2/speak` control that the container's stem fully implements, but it was
+    missing from the pricing catalog's `tts.known_params`, and
+    REJECT_UNKNOWN_PARAMS is on in every image — so the shim answered
+    400 `unsupported_parameter` before stem ever saw it. Nothing caught that
+    because nothing tested it.
+
+    Over SageMaker bidi a pre-upgrade rejection is especially unfriendly: the 400
+    happens before the WebSocket exists, so a client can simply hang rather than
+    see an error (the same shape as the known cross-language-negative hang). That
+    makes an explicit accept-check on this transport worth having separately from
+    the batch one.
+
+    Deliberately NOT asserted: that the audio differs audibly from the default.
+    `expressivity` is Beta and non-default values raise the hallucination risk, so
+    unlike `speed` — whose effect on duration is measurable — there is no stable
+    audio property to gate on. Non-silent audio at each end of the range is.
+    """
+    t0 = time.monotonic()
+    tried, failed = [], []
+    last = None
+    for value in (EXPRESSIVITY_MIN, 0, EXPRESSIVITY_MAX):
+        try:
+            res = await _one_turn(
+                client, ep, voice, "Short expressivity probe.", expressivity=value
+            )
+            ok, note, _ = audio_verdict(bytes(res.audio_bytes), SAMPLE_RATE)
+            tried.append(f"{value}:{'ok' if ok else note}")
+            if not ok:
+                failed.append(str(value))
+            last = res
+        except Exception as e:  # noqa: BLE001
+            msg = str(e)
+            if "unsupported_parameter" in msg or "unsupported parameter" in msg.lower():
+                tried.append(f"{value}:REJECTED-as-unknown-param")
+            else:
+                tried.append(f"{value}:{type(e).__name__}")
+            failed.append(str(value))
+
+    if last is None:
+        return {
+            "scenario": "expressivity",
+            "ok": False,
+            "notes": "every expressivity value failed — " + " ".join(tried),
+            "bytes": 0,
+            "duration_s": 0.0,
+            "rms": 0.0,
+            "chars": 0,
+            "elapsed_s": time.monotonic() - t0,
+        }
+
+    row = _base_row("expressivity", last, t0)
+    row["ok"] = not failed
+    row["notes"] = (
+        f"accepted {EXPRESSIVITY_MIN}..{EXPRESSIVITY_MAX}: " + " ".join(tried)
+        if not failed
+        else f"failed for {','.join(failed)} — " + " ".join(tried)
+    )
+    return row
+
+
+async def sc_expressivity_out_of_range(client, ep, voice):
+    """NEGATIVE control — `expressivity` outside -2..2 must be REJECTED on streaming.
+
+    Pinning the rejection is what establishes the range `expressivity` relies on.
+    A clamp would synthesize at a setting the caller never requested; silent
+    acceptance would mean an unvalidated value reaching the model.
+
+    Note the pass condition is "the session did not produce audio", not "an
+    exception was raised": on this transport a pre-upgrade 400 can surface as a
+    hang or a bare close rather than a clean error, so requiring a specific
+    exception type would make this flaky for the wrong reason.
+    """
+    t0 = time.monotonic()
+    rejected, detail = False, ""
+    try:
+        res = await _one_turn(
+            client, ep, voice, "Short probe.", expressivity=EXPRESSIVITY_OUT_OF_RANGE
+        )
+        n = len(bytes(res.audio_bytes))
+        rejected = n == 0
+        detail = (
+            f"ACCEPTED out-of-range expressivity={EXPRESSIVITY_OUT_OF_RANGE}, got {n}B"
+            if n
+            else "no audio (rejected)"
+        )
+    except Exception as e:  # noqa: BLE001
+        rejected = True
+        msg = str(e).upper()
+        detail = "EXPRESSIVITY_OUT_OF_RANGE" if "OUT_OF_RANGE" in msg else f"{type(e).__name__}"
+    return {
+        "scenario": "expressivity_out_of_range",
+        "ok": rejected,
+        "notes": f"rejected as expected ({detail})" if rejected else detail,
+        "bytes": 0,
+        "duration_s": 0.0,
+        "rms": 0.0,
+        "chars": 0,
+        "elapsed_s": time.monotonic() - t0,
+    }
+
+
 async def sc_configure_speed(client, ep, voice):
     """Mid-stream `Configure{speed}` must be ACKNOWLEDGED and not break the session.
 
@@ -421,6 +538,8 @@ SCENARIOS = {
     "incremental_speak": sc_incremental_speak,
     "long_turn": sc_long_turn,
     "speed": sc_speed,
+    "expressivity": sc_expressivity,
+    "expressivity_out_of_range": sc_expressivity_out_of_range,
     "configure_speed": sc_configure_speed,
     "interrupt": sc_interrupt,
     "unknown_param": sc_unknown_param,

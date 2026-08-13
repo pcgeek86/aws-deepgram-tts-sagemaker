@@ -36,6 +36,28 @@ SILENCE_RMS_FLOOR = 150.0
 MIN_SPEED = 0.85
 MAX_SPEED = 1.15
 
+# Supported `expressivity` range — an INTEGER on a calm-to-animated axis, where 0
+# is the voice's tuned delivery and the production-validated setting.
+#
+# Unlike `speed`, there are TWO distinct ways to get it wrong and they fail
+# differently: a value outside the range is rejected as out-of-range, while a
+# fractional value that is numerically inside it (1.5) is rejected as an invalid
+# increment. Both are 400s rather than clamps, and the scenarios pin each
+# separately so a regression that starts silently accepting either one is visible.
+#
+# `expressivity` is flagged Beta: non-default values raise the risk of
+# hallucinations and pronunciation errors. So the positive scenario asserts the
+# value is ACCEPTED and yields non-silent audio, deliberately NOT that the audio
+# differs audibly from the default — "sounds more animated" is not a stable
+# property to gate a suite on, unlike `speed`, whose effect on duration is
+# measurable.
+EXPRESSIVITY_MIN = -2
+EXPRESSIVITY_MAX = 2
+EXPRESSIVITY_DEFAULT = 0
+# Values that must be REJECTED, one per documented error code.
+EXPRESSIVITY_OUT_OF_RANGE = 3     # -> 400 EXPRESSIVITY_OUT_OF_RANGE
+EXPRESSIVITY_FRACTIONAL = 1.5     # -> 400 EXPRESSIVITY_INCREMENT_INVALID
+
 # ---------------------------------------------------------------------------
 # Test text
 # ---------------------------------------------------------------------------
