@@ -1,0 +1,9 @@
+[project]
+name = "python-agent"
+version = "0.1.0"
+description = "Deepgram Voice Agent driver for the self-contained SageMaker container"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "websockets>=13.0",
+]
