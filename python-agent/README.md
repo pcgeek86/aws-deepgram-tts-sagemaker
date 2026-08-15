@@ -23,12 +23,25 @@ Probes each process on its own port and reports which are up:
 |---|---|---|
 | impeller-asr | 8083 | `/v2/models` |
 | impeller-tts | 8183 | `/v2/models` |
-| vLLM | 3081 | `/v1/models` |
+| vLLM | 3081 | `/v1/models` — **loopback-only, reported SKIP** |
 | stem | 8092 | `/health`, `/v1/agent/settings/think/providers` |
 | inference-shim | 8080 | `/ping` |
 
 Exits non-zero if anything is down. Worth running before every conversation —
 it turns "the agent didn't reply" into a named component in a couple of seconds.
+
+**vLLM always reports SKIP, and that is correct.** The entrypoint starts it with
+`--host 127.0.0.1`, so it listens on the *container's* loopback and `-p 3081:3081`
+cannot reach it. That is deliberate — the LLM is an internal leg that stem dials
+on loopback from inside the container, and it should not be exposed. Check it
+directly instead:
+
+```bash
+docker exec <container> curl -sf http://127.0.0.1:3081/v1/models
+```
+
+An HTTP error on that port (as opposed to a connection failure) is still reported
+as a real FAIL, since something answered.
 
 ## Run a conversation
 

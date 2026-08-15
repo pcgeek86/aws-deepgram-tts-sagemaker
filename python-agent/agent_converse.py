@@ -144,26 +144,50 @@ def cmd_health(args) -> int:
     # Ordered so the first failure is usually the root cause: the engines and the
     # LLM come up independently, stem depends on nothing at boot, and the shim's
     # /ping AND-combines the stem and impeller probes.
+    #
+    # vLLM is marked loopback-only: the entrypoint starts it with
+    # `--host 127.0.0.1`, so it listens on the CONTAINER's loopback and a
+    # published -p 3081:3081 cannot reach it. That is deliberate — the LLM is an
+    # internal leg, and stem dials it on loopback from inside the container. So a
+    # FAIL here from a remote host says nothing about vLLM's health, and treating
+    # it as a real failure would be a standing false alarm.
     checks = [
-        ("impeller-asr  models", f"http://{h}:8083/v2/models"),
-        ("impeller-tts  models", f"http://{h}:8183/v2/models"),
-        ("vllm          models", f"http://{h}:3081/v1/models"),
-        ("stem          health", f"http://{h}:8092/health"),
+        ("impeller-asr  models", f"http://{h}:8083/v2/models", False),
+        ("impeller-tts  models", f"http://{h}:8183/v2/models", False),
+        ("vllm          models", f"http://{h}:3081/v1/models", True),
+        ("stem          health", f"http://{h}:8092/health", False),
         ("stem          think providers",
-         f"http://{h}:8092/v1/agent/settings/think/providers"),
-        ("shim          ping", f"http://{h}:8080/ping"),
+         f"http://{h}:8092/v1/agent/settings/think/providers", False),
+        ("shim          ping", f"http://{h}:8080/ping", False),
     ]
     worst = 0
-    for label, url in checks:
+    loopback_skipped = False
+    for label, url, loopback_only in checks:
         ok, detail = _http_ok(url)
-        print(f"  {'OK  ' if ok else 'FAIL'}  {label:28} {url}")
-        if not ok:
-            print(f"          {detail}")
-            worst = 1
+        if ok:
+            print(f"  OK    {label:28} {url}")
+            continue
+        # Unreachable-from-outside is the EXPECTED result for a loopback-only
+        # service, so only a connection-level failure is excused. An HTTP error
+        # means something answered, and that is a real failure worth failing on.
+        if loopback_only and not detail.startswith("HTTP "):
+            print(f"  SKIP  {label:28} {url}")
+            print("          not published outside the container (expected);"
+                  " verify from inside:")
+            print("          docker exec <container> curl -sf"
+                  " http://127.0.0.1:3081/v1/models")
+            loopback_skipped = True
+            continue
+        print(f"  FAIL  {label:28} {url}")
+        print(f"          {detail}")
+        worst = 1
     print()
     if worst:
         print("At least one component is down. `docker logs <container>` names the")
         print("process on exit; the entrypoint prints a per-process diagnostic.")
+    elif loopback_skipped:
+        print("All externally-published components responding "
+              "(vLLM unchecked — see above).")
     else:
         print("All components responding.")
     return worst
@@ -197,14 +221,31 @@ async def cmd_talk(args) -> int:
             # detector exists to find, so the run would not resemble a call.
             chunk = INPUT_RATE * 2 * CHUNK_MS // 1000
             start = time.monotonic()
+            sent = 0
             for i in range(0, len(pcm), chunk):
                 await ws.send(pcm[i : i + chunk])
-                target = start + (i / chunk + 1) * (CHUNK_MS / 1000)
+                sent += 1
+                target = start + sent * (CHUNK_MS / 1000)
                 await asyncio.sleep(max(0, target - time.monotonic()))
-            # Then hold the socket open: the agent has not even been asked yet.
-            # End-of-turn fires after the audio stops, and only then does the LLM
-            # run and TTS stream back.
-            await asyncio.sleep(args.linger)
+
+            # Keep streaming SILENCE rather than going quiet. Two reasons, and
+            # the first is not optional:
+            #
+            #  1. End-of-turn is detected from the audio itself. If the stream
+            #     simply stops, Flux never receives the pause that ends the turn,
+            #     so no transcript is finalized and the agent is never asked
+            #     anything — the run fails with 0 user turns while ASR is fine.
+            #  2. stem times the connection out when no websocket message arrives
+            #     ("We waited too long for a websocket message").
+            #
+            # A real client streams mic audio continuously, so silence here is
+            # the faithful behavior, not a workaround.
+            silence = b"\x00" * chunk
+            for _ in range(int(args.linger * 1000 / CHUNK_MS)):
+                await ws.send(silence)
+                sent += 1
+                target = start + sent * (CHUNK_MS / 1000)
+                await asyncio.sleep(max(0, target - time.monotonic()))
 
         async def receiver() -> None:
             nonlocal fatal
