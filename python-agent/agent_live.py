@@ -134,15 +134,31 @@ async def run(args) -> int:
                 mic.close()
                 speaker.stop()
                 speaker.close()
-    except ConnectionRefusedError:
+    # Both failures mean "the tunnel isn't working", but they look nothing alike:
+    # nothing listening gives ConnectionRefusedError, while a STALE tunnel (the SSM
+    # session died but the local listener survives) accepts the TCP connection and
+    # then never completes the upgrade, surfacing as a handshake TimeoutError with a
+    # traceback that says nothing about SSM.
+    except (ConnectionRefusedError, TimeoutError, OSError) as e:
+        stale = isinstance(e, TimeoutError)
         print(
-            f"\nCould not reach {url}.\n"
-            "The EC2 host does not accept inbound connections, so this needs an "
-            "SSM tunnel running in another terminal:\n\n"
+            f"\nCould not reach {url} ({type(e).__name__}).\n"
+            + (
+                "The port is open but the connection hung, which usually means a "
+                "STALE tunnel: the SSM session dropped (look for 'broken pipe' in "
+                "its output) while the local listener stayed up. Kill it and start "
+                "a fresh one.\n"
+                if stale
+                else "Nothing is listening locally, so the tunnel is not running.\n"
+            )
+            + "\nThe EC2 host accepts no inbound connections, so this needs an SSM "
+            "tunnel in another terminal:\n\n"
             "  aws ssm start-session --target <instance-id> --region us-east-2 \\\n"
             "      --document-name AWS-StartPortForwardingSession \\\n"
             "      --parameters '{\"portNumber\":[\"8092\"],"
-            "\"localPortNumber\":[\"8092\"]}'\n",
+            "\"localPortNumber\":[\"8092\"]}'\n\n"
+            "Verify before retrying:  curl -sf -o /dev/null -w '%{http_code}\\n' "
+            "http://127.0.0.1:8092/health   # expect 204\n",
             file=sys.stderr,
         )
         return 1
