@@ -30,6 +30,8 @@ import asyncio
 import json
 import queue
 import sys
+import threading
+from collections import deque
 
 try:
     import sounddevice as sd
@@ -65,6 +67,35 @@ async def run(args) -> int:
             print(f"  [audio] input status: {status}", file=sys.stderr)
         mic_q.put(bytes(indata))
 
+    # Agent audio is played from a callback-fed deque rather than blocking writes,
+    # and barge-in clears that deque. Both halves of that matter:
+    #
+    #   * `RawOutputStream.write()` BLOCKS when the device buffer is full, and the
+    #     agent's audio arrives much faster than real time — so a blocking write
+    #     stalls this coroutine and `UserStartedSpeaking` isn't even processed until
+    #     the backlog drains.
+    #   * `stream.stop()` does NOT discard buffered audio; PortAudio drains it first.
+    #     So stopping on barge-in still plays the rest of the agent's sentence, which
+    #     looks exactly like barge-in being broken when the server side is fine.
+    #
+    # Dropping the queued bytes is what actually makes the agent go quiet mid-word.
+    play_q: deque[bytes] = deque()
+    play_lock = threading.Lock()
+
+    def on_speaker(outdata, frames, time_info, status):
+        need = frames * 2  # int16 mono
+        buf = bytearray()
+        with play_lock:
+            while play_q and len(buf) < need:
+                chunk = play_q.popleft()
+                take = min(len(chunk), need - len(buf))
+                buf += chunk[:take]
+                if take < len(chunk):
+                    play_q.appendleft(chunk[take:])
+        if len(buf) < need:  # underrun: play silence rather than glitch
+            buf += b"\x00" * (need - len(buf))
+        outdata[:] = bytes(buf)
+
     print(f"connecting: {url}")
     print(f"  asr={args.asr_model}  llm={args.llm_model}  tts={args.tts_model}")
 
@@ -73,7 +104,11 @@ async def run(args) -> int:
             await ws.send(json.dumps(settings))
 
             speaker = sd.RawOutputStream(
-                samplerate=OUTPUT_RATE, channels=1, dtype="int16"
+                samplerate=OUTPUT_RATE,
+                channels=1,
+                dtype="int16",
+                blocksize=OUTPUT_RATE * CHUNK_MS // 1000,
+                callback=on_speaker,
             )
             speaker.start()
             mic = sd.RawInputStream(
@@ -97,7 +132,8 @@ async def run(args) -> int:
             async def receiver() -> None:
                 async for msg in ws:
                     if isinstance(msg, bytes):
-                        speaker.write(msg)
+                        with play_lock:
+                            play_q.append(msg)
                         continue
                     try:
                         m = json.loads(msg)
@@ -108,11 +144,20 @@ async def run(args) -> int:
                         role = m.get("role", "?")
                         print(f"  [{role}] {m.get('content', '')}")
                     elif t == "UserStartedSpeaking":
-                        # Drop already-queued agent audio so a barge-in sounds
-                        # like an interruption instead of both talking at once.
+                        # Drop already-queued agent audio so a barge-in sounds like
+                        # an interruption instead of both talking at once. The server
+                        # has already stopped generating by this point; what remains
+                        # is whatever we buffered locally, which is a lot because the
+                        # audio arrives faster than real time.
                         if args.barge_in_stops_playback:
-                            speaker.stop()
-                            speaker.start()
+                            with play_lock:
+                                dropped = sum(len(c) for c in play_q)
+                                play_q.clear()
+                            if dropped and args.verbose:
+                                print(
+                                    f"  [barge-in] dropped {dropped / 2 / OUTPUT_RATE:.1f}s"
+                                    " of queued agent audio"
+                                )
                     elif t in ("Error", "Warning"):
                         detail = (
                             m.get("description") or m.get("message") or json.dumps(m)
