@@ -59,6 +59,9 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import boto3
+from botocore.config import Config as BotoConfig
+
 # Same directory imports so the e2e suite can be run from anywhere.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from e2e_test_common import (
@@ -371,6 +374,7 @@ def _stress_cmd(
     connections: int,
     summary_path: Path,
     extra: list[str],
+    fips: bool = False,
 ) -> list[str]:
     cmd = [
         "uv", "run", "--project", str(script.parent),
@@ -382,6 +386,8 @@ def _stress_cmd(
         "--connections", str(connections),
         "--summary-jsonl", str(summary_path),
     ]
+    if fips:
+        cmd.append("--fips")
     cmd.extend(extra)
     return cmd
 
@@ -419,6 +425,7 @@ def run_scenario(
     stress_script: Path,
     log_dir: Path,
     subprocess_timeout_s: int,
+    fips: bool = False,
 ) -> dict:
     if scenario.use_long_form:
         wav, expected = long_wav, expected_text_for_loops(long_loops)
@@ -435,6 +442,7 @@ def run_scenario(
     cmd = _stress_cmd(
         stress_script, endpoint, wav, region, model, language,
         scenario.connections, summary_path, scenario.extra_args,
+        fips=fips,
     )
     logger.info(f"[{scenario.name}] running: {' '.join(cmd)}")
 
@@ -634,6 +642,15 @@ def _make_parser() -> argparse.ArgumentParser:
         help="Streaming SageMaker endpoint name (required unless --list)",
     )
     p.add_argument("--region", default="us-east-2", help="AWS region (default: us-east-2)")
+    p.add_argument(
+        "--fips",
+        action="store_true",
+        help=(
+            "Run the battery against the FIPS 140-3 SageMaker runtime endpoint "
+            "(runtime-fips.sagemaker.<region>.amazonaws.com:8443). OFF by default; "
+            "passed through to every stt_wav_stress.py subprocess."
+        ),
+    )
     p.add_argument("--model", default="nova-3", help="Deepgram model (default: nova-3)")
     p.add_argument("--language", default="en", help="Language code (default: en)")
     p.add_argument(
@@ -729,6 +746,15 @@ def main() -> int:
     print("=" * 80)
     print(f"Endpoint:    {args.endpoint_name}")
     print(f"Region:      {args.region}")
+    # Resolved the same way stt_wav_stress.py derives its bidi endpoint, so the
+    # header states the host the subprocesses will actually stream to (FIPS or
+    # not) rather than assuming the default one.
+    _rt_url = boto3.Session(region_name=args.region).client(
+        "sagemaker-runtime",
+        config=BotoConfig(use_fips_endpoint=True) if args.fips else None,
+    ).meta.endpoint_url
+    print(f"Runtime URL: {_rt_url}:8443")
+    print(f"FIPS:        {'yes' if '-fips.' in _rt_url else 'no'}")
     print(f"Model/lang:  {args.model} / {args.language}")
     print(f"Workdir:     {workdir}")
     print("=" * 80)
@@ -789,6 +815,7 @@ def main() -> int:
             stress_script=stress_script,
             log_dir=log_dir,
             subprocess_timeout_s=args.subprocess_timeout_s,
+            fips=args.fips,
         )
         rows.append(row)
         flag = "SKIP" if row.get("skipped") else ("PASS" if row["ok"] else "FAIL")

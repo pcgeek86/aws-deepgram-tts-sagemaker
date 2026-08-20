@@ -46,6 +46,7 @@ from smithy_aws_core.identity import EnvironmentCredentialsResolver
 from smithy_aws_core.auth.sigv4 import SigV4AuthScheme
 from smithy_http.aio.crt import AWSCRTHTTPClient, _AWSCRTEventLoop
 import awscrt.io as crt_io
+from botocore.config import Config as BotoConfig
 
 # Configuration constants
 DEFAULT_REGION = "us-east-2"
@@ -76,6 +77,42 @@ REDACT_ENTITIES = [
     "language", "marital_status", "organization", "political_affiliation",
     "religion", "routing_number", "zodiac_sign",
 ]
+
+
+def aws_config(fips: bool = False) -> BotoConfig | None:
+    """botocore Config for this run — FIPS endpoints when `fips`, else default.
+
+    FIPS is applied PER CLIENT rather than by exporting
+    AWS_USE_FIPS_ENDPOINT for the whole process. That variable also redirects
+    the IAM Identity Center portal botocore calls to mint SSO credentials, and
+    portal.sso-fips.<region>.amazonaws.com does not exist (NXDOMAIN in
+    us-east-2 and us-west-2, checked 2026-08-20) — so with an SSO profile whose
+    role credentials are not already cached, a process-wide switch dies during
+    credential resolution with an EndpointConnectionError naming an SSO URL,
+    before it ever reaches SageMaker. (A warm cache masks it, which makes the
+    failure look intermittent.) Scoping FIPS to the client sidesteps it
+    entirely: the credential chain keeps its normal endpoints.
+    """
+    return BotoConfig(use_fips_endpoint=True) if fips else None
+
+
+def resolve_bidi_endpoint(region: str, fips: bool = False) -> str:
+    """SageMaker bidi-streaming URL for `region` (port 8443, per AWS's
+    bidirectional-stream requirement).
+
+    Derived from botocore's own sagemaker-runtime endpoint resolution rather
+    than a hardcoded hostname, so `--fips` moves the stream onto
+    runtime-fips.sagemaker.<region>.amazonaws.com. The smithy HTTP/2 client
+    takes a literal `endpoint_uri` and performs no resolution of its own, so
+    without this the stream would silently stay on the NON-FIPS host while
+    every boto3 call in the same run honored the FIPS setting — a FIPS run that
+    quietly is not one.
+    """
+    url = (boto3.Session(region_name=region)
+           .client("sagemaker-runtime", config=aws_config(fips))
+           .meta.endpoint_url)
+    return f"{url}:8443"
+
 
 logger = logging.getLogger(__name__)
 
@@ -583,7 +620,7 @@ class MultiConnectionWAVClient:
 
     def __init__(self, endpoint_name, wav_path, region=DEFAULT_REGION, num_connections=1,
                  use_close_stream=True, raw=False, ring_size: int = 50,
-                 control_data_type: str = "UTF8"):
+                 control_data_type: str = "UTF8", fips: bool = False):
         self.endpoint_name = endpoint_name
         self.wav_path = wav_path
         self.region = region
@@ -592,7 +629,8 @@ class MultiConnectionWAVClient:
         self.control_data_type = control_data_type
         self.raw = raw
         self.ring_size = ring_size
-        self.bidi_endpoint = f"https://runtime.sagemaker.{region}.amazonaws.com:8443"
+        self.fips = fips
+        self.bidi_endpoint = resolve_bidi_endpoint(region, fips)
         self._clients: list[SageMakerRuntimeHTTP2Client] = []
         self._credentials_ready = False
         self.connections = []
@@ -1037,10 +1075,12 @@ class BatchSTTClient:
     split the audio into shorter segments.
     """
 
-    def __init__(self, endpoint_name: str, wav_path: str, region: str = DEFAULT_REGION):
+    def __init__(self, endpoint_name: str, wav_path: str, region: str = DEFAULT_REGION,
+                 fips: bool = False):
         self.endpoint_name = endpoint_name
         self.wav_path = wav_path
         self.region = region
+        self.fips = fips
         self._session: boto3.Session | None = None
         self._thread_local = threading.local()
 
@@ -1074,7 +1114,8 @@ class BatchSTTClient:
     def _get_thread_client(self):
         """Return a per-thread boto3 sagemaker-runtime client, creating one if needed."""
         if not hasattr(self._thread_local, 'sm_client'):
-            self._thread_local.sm_client = self._session.client('sagemaker-runtime')
+            self._thread_local.sm_client = self._session.client(
+                'sagemaker-runtime', config=aws_config(self.fips))
             logger.debug(f"Created sagemaker-runtime client for thread {threading.current_thread().name}")
         return self._thread_local.sm_client
 
@@ -1443,6 +1484,16 @@ def _add_common_args(parser: argparse.ArgumentParser):
         help=f"AWS region (default: {DEFAULT_REGION})",
     )
     parser.add_argument(
+        "--fips",
+        action="store_true",
+        help=(
+            "Send traffic to the FIPS 140-3 SageMaker runtime endpoint "
+            "(runtime-fips.sagemaker.<region>.amazonaws.com) instead of the "
+            "standard one. OFF by default. Not available in every region — see "
+            "https://docs.aws.amazon.com/general/latest/gr/rande.html#FIPS-endpoints"
+        ),
+    )
+    parser.add_argument(
         "--log-level",
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
@@ -1511,6 +1562,7 @@ async def run_stream(args) -> int:
         raw=args.raw,
         ring_size=args.ring_size,
         control_data_type=args.control_data_type,
+        fips=args.fips,
     )
 
     try:
@@ -1546,6 +1598,8 @@ async def run_stream(args) -> int:
     print(f"Model:        {args.model}")
     print(f"Language:     {args.language}")
     print(f"Region:       {args.region}")
+    print(f"Bidi URL:     {client.bidi_endpoint}")
+    print(f"FIPS:         {'yes' if '-fips.' in client.bidi_endpoint else 'no'}")
     print(f"Loop:         {'yes' if args.loop else 'no'}")
     print(f"Close:        {'CloseStream + WS Close' if args.use_close_stream else 'bare WS Close'}")
     if args.use_close_stream:
@@ -1716,6 +1770,7 @@ async def run_batch(args) -> int:
         endpoint_name=args.endpoint_name,
         wav_path=args.file,
         region=args.region,
+        fips=args.fips,
     )
 
     # Load WAV early for validation and metadata
@@ -1743,6 +1798,9 @@ async def run_batch(args) -> int:
     print(f"Model:        {args.model}")
     print(f"Language:     {args.language}")
     print(f"Region:       {args.region}")
+    _rt_url = client._get_thread_client().meta.endpoint_url
+    print(f"Runtime URL:  {_rt_url}")
+    print(f"FIPS:         {'yes' if '-fips.' in _rt_url else 'no'}")
     print(f"Requests:     {args.requests}")
     print(f"Concurrency:  {args.concurrency}")
     if redact_list:

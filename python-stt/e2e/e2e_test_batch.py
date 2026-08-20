@@ -58,6 +58,7 @@ from pathlib import Path
 from urllib.parse import quote, urlparse
 
 import boto3
+from botocore.config import Config as BotoConfig
 from botocore.exceptions import ClientError, NoCredentialsError, PartialCredentialsError
 
 # Same-directory imports.
@@ -73,6 +74,32 @@ from e2e_test_common import (
     validate_pcm16,
     wer,
 )
+
+# Set once from --fips in main(); read by aws_client() for every client built
+# in this run. OFF by default — the standard endpoints are used unless asked.
+_FIPS = False
+
+
+def aws_client(session: "boto3.Session", service: str, region: str | None = None):
+    """boto3 client honoring this run's --fips setting.
+
+    FIPS is applied PER CLIENT rather than by exporting
+    AWS_USE_FIPS_ENDPOINT for the whole process. That variable also redirects
+    the IAM Identity Center portal botocore calls to mint SSO credentials, and
+    portal.sso-fips.<region>.amazonaws.com does not exist (NXDOMAIN in
+    us-east-2 and us-west-2, checked 2026-08-20) — so with an SSO profile whose
+    role credentials are not already cached, a process-wide switch dies during
+    credential resolution with an EndpointConnectionError naming an SSO URL,
+    before it ever reaches SageMaker. (A warm cache masks it, which makes the
+    failure look intermittent.) Scoping FIPS to the client sidesteps it
+    entirely: the credential chain keeps its normal endpoints.
+    """
+    cfg = BotoConfig(use_fips_endpoint=True) if _FIPS else None
+    kw = {"config": cfg}
+    if region is not None:
+        kw["region_name"] = region
+    return session.client(service, **kw)
+
 
 DEFAULT_REGION = "us-east-2"
 DEFAULT_UPLOAD_PREFIX = "stt-e2e-batch-input"
@@ -523,8 +550,8 @@ def preflight_async_iam(
     Falls back to a HeadBucket + zero-byte probe write/delete when the
     caller lacks iam:SimulatePrincipalPolicy. Final fallback is a WARN.
     """
-    sm = session.client("sagemaker", region_name=region)
-    iam = session.client("iam")
+    sm = aws_client(session, "sagemaker", region)
+    iam = aws_client(session, "iam")
     ep = sm.describe_endpoint(EndpointName=endpoint)
     cfg = sm.describe_endpoint_config(EndpointConfigName=ep["EndpointConfigName"])
     variant = cfg["ProductionVariants"][0]
@@ -563,7 +590,7 @@ def preflight_async_iam(
         if code not in ("AccessDenied", "AccessDeniedException", "UnauthorizedOperation"):
             raise
         logger.info("preflight: caller lacks iam:SimulatePrincipalPolicy (%s); using probe fallback", code)
-    s3 = session.client("s3", region_name=region)
+    s3 = aws_client(session, "s3", region)
     probe_key = f"_preflight-probe-{uuid.uuid4()}.tmp"
     for b, prefix in ((bucket, upload_prefix), (out_bucket, out_key_prefix), (fail_bucket, fail_key_prefix)):
         key = f"{prefix.strip('/')}/{probe_key}"
@@ -592,7 +619,7 @@ def _sync_invoke_once(
     audio_bytes: bytes,
     custom_attributes: str,
 ) -> tuple[float, dict | None, str | None]:
-    sm = session.client("sagemaker-runtime", region_name=region)
+    sm = aws_client(session, "sagemaker-runtime", region)
     start = time.monotonic()
     try:
         resp = sm.invoke_endpoint(
@@ -757,7 +784,7 @@ def run_sync_scenario(
 # ---------------------------------------------------------------------------
 
 def _upload_input(session: boto3.Session, region: str, wav: Path, bucket: str, prefix: str) -> str:
-    s3 = session.client("s3", region_name=region)
+    s3 = aws_client(session, "s3", region)
     key = f"{prefix.strip('/')}/{uuid.uuid4()}.wav"
     s3.upload_file(str(wav), bucket, key, ExtraArgs={"ContentType": "audio/wav"})
     return f"s3://{bucket}/{key}"
@@ -774,8 +801,8 @@ def _async_invoke_once(
     inference_id: str,
 ) -> tuple[float, dict | None, str | None, str]:
     """Submit + poll one async invocation. Returns (elapsed, response, error, out_uri)."""
-    sm = session.client("sagemaker-runtime", region_name=region)
-    s3 = session.client("s3", region_name=region)
+    sm = aws_client(session, "sagemaker-runtime", region)
+    s3 = aws_client(session, "s3", region)
     start = time.monotonic()
     try:
         r = sm.invoke_endpoint_async(
@@ -988,6 +1015,12 @@ def _make_parser() -> argparse.ArgumentParser:
                    help=f"S3 key prefix for uploads (default: {DEFAULT_UPLOAD_PREFIX!r})")
     p.add_argument("--region", default=DEFAULT_REGION,
                    help=f"AWS region (default: {DEFAULT_REGION})")
+    p.add_argument("--fips", action="store_true",
+                   help="Run the battery against the FIPS 140-3 SageMaker endpoints "
+                        "(runtime-fips./api-fips.sagemaker.<region>.amazonaws.com, "
+                        "s3-fips). OFF by default. Not available in every region — see "
+                        "https://docs.aws.amazon.com/general/latest/gr/rande.html"
+                        "#FIPS-endpoints")
     p.add_argument("--model", default="nova-3", help="Deepgram model (default: nova-3)")
     p.add_argument("--language", default="en", help="Language code (default: en)")
     p.add_argument("--workdir", default=None, metavar="DIR",
@@ -1014,6 +1047,8 @@ def _make_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = _make_parser().parse_args()
+    global _FIPS
+    _FIPS = args.fips           # must be set before the first aws_client() call
     logging.basicConfig(level=getattr(logging, args.log_level),
                         format="%(asctime)s %(levelname)s %(message)s")
 
@@ -1067,7 +1102,7 @@ def main() -> int:
     # AWS session
     try:
         session = boto3.Session(region_name=args.region)
-        session.client("sts").get_caller_identity()
+        aws_client(session, "sts").get_caller_identity()
     except (NoCredentialsError, PartialCredentialsError) as e:
         print(f"ERROR: AWS credentials missing: {e}", file=sys.stderr)
         return 2
@@ -1090,6 +1125,10 @@ def main() -> int:
     print(f"Endpoint:    {args.endpoint_name}")
     print(f"Mode:        {args.mode}")
     print(f"Region:      {args.region}")
+    _rt_url = aws_client(boto3.Session(region_name=args.region),
+                         "sagemaker-runtime", args.region).meta.endpoint_url
+    print(f"Runtime URL: {_rt_url}")
+    print(f"FIPS:        {'yes' if '-fips.' in _rt_url else 'no'}")
     if args.mode == "async":
         print(f"Bucket:      {args.bucket}")
     print(f"Workdir:     {workdir}")

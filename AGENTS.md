@@ -95,6 +95,40 @@ uv run e2e/e2e_test_streaming.py <endpoint-name>
 `uv sync` is not required up front — `uv run` resolves the project venv on
 first call.
 
+### `--fips` routes traffic to the FIPS 140-3 endpoints (OFF by default)
+
+`python-stt`'s `e2e_test_streaming.py`, `e2e_test_batch.py` and
+`stt_wav_stress.py` (both `stream` and `batch`) take `--fips`, which moves every
+AWS call in the run onto the FIPS endpoints — `runtime-fips.sagemaker.<region>
+.amazonaws.com`, `api-fips.…`, `s3-fips.…`. Omit it and nothing changes. Not
+every region has them: https://docs.aws.amazon.com/general/latest/gr/rande.html#FIPS-endpoints
+
+Each run prints the resolved URL plus `FIPS: yes|no` in its header, so a log
+proves which endpoints were used rather than asserting it.
+
+Two non-obvious things:
+
+- **The bidi stream needs this explicitly — it cannot inherit FIPS from AWS
+  config.** The smithy HTTP/2 client takes a literal `endpoint_uri` and performs
+  no endpoint resolution, so the streaming URL used to be a hardcoded
+  `runtime.sagemaker.<region>.amazonaws.com:8443`. Without the flag the stream
+  would silently stay on the non-FIPS host while every boto3 call in the same run
+  honored the FIPS setting. `resolve_bidi_endpoint()` now derives it from
+  botocore's own `sagemaker-runtime` resolution and appends `:8443`. Verified
+  2026-08-20: bidi streaming **does** work on port 8443 of the FIPS host
+  (nova-3 monolingual, us-west-2).
+- **Do NOT set `AWS_USE_FIPS_ENDPOINT=true` process-wide with an SSO profile.**
+  That variable also redirects the IAM Identity Center portal, and
+  `portal.sso-fips.<region>.amazonaws.com` does not exist, so the run dies during
+  credential resolution with `EndpointConnectionError` naming an SSO URL — before
+  it reaches SageMaker at all. `--fips` applies FIPS **per client** instead, which
+  leaves the credential chain on its normal endpoints. A warm credential cache
+  masks the failure, so it presents as intermittent.
+
+Coverage is `python-stt` only. `python-flux`, `python-tts`, `python-flux-tts`,
+the JS clients and the Java load test still hardcode the non-FIPS bidi host; each
+needs the same one-line change to gain FIPS support.
+
 ### Multilingual endpoints take `--language multi`, not a specific code
 
 A multilingual STT listing (e.g. the **Nova-3 Multilingual STT Streaming**
