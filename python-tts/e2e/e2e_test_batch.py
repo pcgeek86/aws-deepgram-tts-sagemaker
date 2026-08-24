@@ -55,6 +55,23 @@ from pathlib import Path
 from urllib.parse import quote, urlparse
 
 import boto3
+from botocore.config import Config as BotoConfig
+
+# Set once from --fips in main(). Applied PER CLIENT rather than by exporting
+# AWS_USE_FIPS_ENDPOINT, which would also redirect the IAM Identity Center portal
+# botocore uses to mint SSO credentials — portal.sso-fips.<region>.amazonaws.com
+# does not exist, so a process-wide switch kills credential resolution before the
+# run reaches SageMaker at all (a warm credential cache hides it, making the
+# failure look intermittent).
+_FIPS = False
+
+
+def _client(session, service, region=None):
+    """Build a boto3 client with the run's FIPS endpoint setting applied."""
+    kwargs = {"config": BotoConfig(use_fips_endpoint=True)} if _FIPS else {}
+    if region is not None:
+        kwargs["region_name"] = region
+    return session.client(service, **kwargs)
 from botocore.exceptions import ClientError, NoCredentialsError, PartialCredentialsError
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -337,7 +354,7 @@ def _speak_once(
     custom_attributes: str,
 ) -> tuple[float, bytes | None, str | None, str | None]:
     """One synchronous synthesize. Returns (elapsed, audio_bytes, content_type, error)."""
-    sm = session.client("sagemaker-runtime", region_name=region)
+    sm = _client(session, "sagemaker-runtime", region)
     start = time.monotonic()
     try:
         resp = sm.invoke_endpoint(
@@ -369,8 +386,8 @@ def preflight_async_iam(session, region, endpoint, bucket, upload_prefix) -> Non
     read the input or write the output / failure prefixes (SageMaker's async
     dispatcher uses the *endpoint's* role, not the caller's — a missing
     permission silently queues the job for the full timeout)."""
-    sm = session.client("sagemaker", region_name=region)
-    iam = session.client("iam")
+    sm = _client(session, "sagemaker", region)
+    iam = _client(session, "iam")
     ep = sm.describe_endpoint(EndpointName=endpoint)
     cfg = sm.describe_endpoint_config(EndpointConfigName=ep["EndpointConfigName"])
     model = sm.describe_model(ModelName=cfg["ProductionVariants"][0]["ModelName"])
@@ -406,8 +423,8 @@ def _async_speak_once(session, region, endpoint, text, custom, ctx) -> tuple[flo
     """Upload the text to S3, invoke_endpoint_async, poll for the output audio.
     Returns (elapsed, audio_bytes, output_uri, error) — output_uri in the
     content_type slot so the caller can surface where the audio landed."""
-    s3 = session.client("s3", region_name=region)
-    sm = session.client("sagemaker-runtime", region_name=region)
+    s3 = _client(session, "s3", region)
+    sm = _client(session, "sagemaker-runtime", region)
     start = time.monotonic()
     key = f"{ctx['upload_prefix'].strip('/')}/{uuid.uuid4()}.json"
     try:
@@ -651,6 +668,11 @@ def _make_parser() -> argparse.ArgumentParser:
                    help="Log directory (default: /tmp/dg-sagemaker-e2e/tts-batch/<ts>)")
     p.add_argument("--scenarios", default="", metavar="NAME,NAME,...",
                    help="Comma-separated subset of scenario names (default: all). See --list.")
+    p.add_argument("--fips", action="store_true",
+                   help="Route AWS calls to the FIPS 140-3 endpoints (api-fips control "
+                        "plane, runtime-fips invoke, s3-fips for --mode async). OFF by "
+                        "default. Selects AWS endpoints only — says nothing about the "
+                        "container's own crypto.")
     p.add_argument("--list", action="store_true", help="List scenarios and exit")
     p.add_argument("--invocation-timeout-s", type=int, default=600,
                    help="(async) per-invocation timeout passed to SageMaker (default: 600)")
@@ -685,7 +707,15 @@ def _resolve_language_and_voice(args) -> tuple[str, str]:
 
 
 def main() -> int:
+    def _activate_fips(on: bool) -> None:
+        """Must run before ANY client is built — including the sts credential
+        probe further down. Set after that point, part of the run silently used
+        the standard endpoints while the log claimed FIPS."""
+        global _FIPS
+        _FIPS = on
+
     args = _make_parser().parse_args()
+    _activate_fips(args.fips)
     logging.basicConfig(level=getattr(logging, args.log_level),
                         format="%(asctime)s %(levelname)s %(message)s")
 
@@ -728,7 +758,7 @@ def main() -> int:
 
     try:
         session = boto3.Session(region_name=args.region)
-        session.client("sts").get_caller_identity()
+        _client(session, "sts").get_caller_identity()
     except (NoCredentialsError, PartialCredentialsError) as e:
         print(f"ERROR: AWS credentials missing: {e}", file=sys.stderr)
         return 2
@@ -753,6 +783,7 @@ def main() -> int:
     print(f"Endpoint:    {args.endpoint_name}")
     print(f"Mode:        {args.mode}")
     print(f"Region:      {args.region}")
+    print(f"FIPS:        {'yes (--fips)' if args.fips else 'no'}")
     print(f"Language:    {language}")
     print(f"Voice:       {voice}")
     if args.mode == "async":
