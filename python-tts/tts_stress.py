@@ -23,6 +23,7 @@ import wave
 from array import array
 from queue import Queue
 import boto3
+from botocore.config import Config as BotoConfig
 from botocore.exceptions import ClientError, NoCredentialsError, PartialCredentialsError
 from aws_sdk_sagemaker_runtime_http2.client import SageMakerRuntimeHTTP2Client
 from aws_sdk_sagemaker_runtime_http2.config import Config, HTTPAuthSchemeResolver
@@ -711,14 +712,21 @@ class MultiConnectionTTSClient:
     """
 
     def __init__(self, endpoint_name, region=DEFAULT_REGION, num_connections=1,
-                 playback_connection_id=1, collect_audio=False):
+                 playback_connection_id=1, collect_audio=False, fips=False):
         self.endpoint_name = endpoint_name
         self.region = region
+        self.fips = fips
         self.num_connections = num_connections
         # playback_connection_id == 0 means headless (no speaker playback).
         self.playback_connection_id = playback_connection_id
         self.collect_audio = collect_audio
-        self.bidi_endpoint = f"https://runtime.sagemaker.{region}.amazonaws.com:8443"
+        # Bidi streaming is served on port 8443 of the runtime host, and the FIPS
+        # host serves it too (verified 2026-08-20, us-west-2) — nothing documents
+        # 8443 as FIPS-served, so that was the open question and it is settled.
+        # This selects the AWS ENDPOINT only; it says nothing about the
+        # container's own crypto.
+        _rt_host = ("runtime-fips" if fips else "runtime")
+        self.bidi_endpoint = f"https://{_rt_host}.sagemaker.{region}.amazonaws.com:8443"
         self.client = None
         self._boto_session = None
         self.connections = []
@@ -726,6 +734,18 @@ class MultiConnectionTTSClient:
         self.pyaudio_instance = None
         self.audio_stream = None
         self._ended = False
+
+    def _boto_cfg(self):
+        """Per-client FIPS config, or None.
+
+        Deliberately per-client rather than AWS_USE_FIPS_ENDPOINT: that variable
+        also redirects the IAM Identity Center portal used to mint SSO
+        credentials, and portal.sso-fips.<region>.amazonaws.com does not exist —
+        so with an SSO profile the run dies during credential resolution, long
+        before it reaches SageMaker. A warm credential cache hides it, which
+        makes the failure look intermittent.
+        """
+        return BotoConfig(use_fips_endpoint=True) if self.fips else None
 
     def _initialize_client(self):
         """Initialize the SageMaker Runtime HTTP2 client with AWS credentials"""
@@ -749,7 +769,7 @@ class MultiConnectionTTSClient:
             logger.debug("AWS credentials successfully loaded")
 
             # Optionally log the credential source for debugging
-            caller_identity = session.client('sts').get_caller_identity()
+            caller_identity = session.client('sts', config=self._boto_cfg()).get_caller_identity()
             logger.debug(f"Authenticated as: {caller_identity.get('Arn', 'Unknown')}")
 
         except (NoCredentialsError, PartialCredentialsError) as e:
@@ -789,7 +809,8 @@ class MultiConnectionTTSClient:
             self._initialize_client()
 
         assert self._boto_session is not None
-        sm_client = self._boto_session.client("sagemaker", region_name=self.region)
+        sm_client = self._boto_session.client("sagemaker", region_name=self.region,
+                                              config=self._boto_cfg())
         try:
             response = sm_client.describe_endpoint(EndpointName=self.endpoint_name)
         except ClientError as e:
@@ -1157,6 +1178,16 @@ async def main():
              "raw bytes otherwise)."
     )
     parser.add_argument(
+        "--fips",
+        action="store_true",
+        help="Route AWS calls to the FIPS 140-3 endpoints: the SageMaker control "
+             "plane (api-fips) and bidi streaming on runtime-fips.sagemaker."
+             "<region>.amazonaws.com:8443. OFF by default. This selects AWS "
+             "endpoints only and makes no claim about the container's own crypto. "
+             "Not available in every region: "
+             "https://docs.aws.amazon.com/general/latest/gr/rande.html#FIPS-endpoints",
+    )
+    parser.add_argument(
         "--region",
         default="us-east-2",
         help="AWS region (default: us-east-2)"
@@ -1265,7 +1296,11 @@ async def main():
         num_connections=args.connections,
         playback_connection_id=args.playback,
         collect_audio=collect_audio,
+        fips=args.fips,
     )
+    # Printed, not asserted: the log itself is the proof of which endpoint was used.
+    print(f"Bidi URL: {client.bidi_endpoint}")
+    print(f"FIPS: {'yes' if '-fips.' in client.bidi_endpoint else 'no'}")
 
     loop = asyncio.get_running_loop()
     streaming_task = None

@@ -69,6 +69,7 @@ from flux_tts_client import (  # noqa: E402
     DEFAULT_VOICE,
     FluxTtsStream,
     ensure_env_credentials,
+    bidi_endpoint_uri,
     make_client,
 )
 
@@ -430,7 +431,10 @@ SCENARIOS = {
 
 async def main_async(args) -> int:
     ensure_env_credentials(args.region)
-    client = make_client(args.region)
+    client = make_client(args.region, args.fips)
+    # Printed, not asserted — the log is the proof of which endpoint was used.
+    print(f"Bidi URL:    {bidi_endpoint_uri(args.region, args.fips)}")
+    print(f"FIPS:        {'yes (--fips)' if args.fips else 'no'}")
     names = select_scenarios(list(SCENARIOS), args.scenarios)
     rows = []
     for name in names:
@@ -462,6 +466,11 @@ def main() -> int:
     p.add_argument("--region", default="us-east-2")
     p.add_argument("--voice", default=DEFAULT_VOICE, help=f"default: {DEFAULT_VOICE}")
     p.add_argument("--scenarios", default=None, help="comma-separated subset")
+    p.add_argument("--fips", action="store_true",
+                   help="Route AWS calls to the FIPS 140-3 endpoints (bidi streaming on "
+                        "runtime-fips.sagemaker.<region>.amazonaws.com:8443). OFF by "
+                        "default. Selects AWS endpoints only — says nothing about the "
+                        "container's own crypto.")
     p.add_argument("--list", action="store_true", help="list scenarios and exit")
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args()

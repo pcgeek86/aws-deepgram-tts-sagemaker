@@ -125,9 +125,25 @@ Two non-obvious things:
   leaves the credential chain on its normal endpoints. A warm credential cache
   masks the failure, so it presents as intermittent.
 
-Coverage is `python-stt` only. `python-flux`, `python-tts`, `python-flux-tts`,
-the JS clients and the Java load test still hardcode the non-FIPS bidi host; each
-needs the same one-line change to gain FIPS support.
+Coverage: `python-stt`, plus **`python-tts`** (aura-2 — `tts_stress.py` and both
+e2e drivers) and **`python-flux-tts`** (both e2e drivers + `flux_tts_client.py`)
+as of 2026-08-24. Still hardcoding the non-FIPS bidi host: `python-flux` (flux
+ASR), the JS clients, and the Java load test — each needs the same one-line
+change.
+
+Two shapes, depending on how the driver reaches AWS:
+
+- `python-flux-tts` builds its bidi client directly, so `bidi_endpoint_uri(region,
+  fips)` is the single switch.
+- `python-tts/e2e/e2e_test_batch.py` builds boto3 clients in five different
+  places, so it routes them through a `_client(session, service, region)` helper
+  reading a module-level `_FIPS`, activated by `_activate_fips(args.fips)`
+  immediately after `parse_args`. **That position matters** — the credential
+  probe (`sts`) runs further down `main()`, so activating any later leaves it on
+  the standard endpoint while the header already printed `FIPS: yes`.
+- `python-tts/e2e/e2e_test_streaming.py` is a wrapper that shells out to
+  `tts_stress.py`, so it just appends `--fips` to the subprocess command; the
+  real switch lives in `tts_stress.py` (`_boto_cfg()` + the `runtime-fips` host).
 
 ### Multilingual endpoints take `--language multi`, not a specific code
 

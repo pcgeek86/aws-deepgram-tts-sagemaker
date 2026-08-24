@@ -26,6 +26,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 import boto3
+from botocore.config import Config as BotoConfig
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -282,6 +283,10 @@ def main() -> int:
     p.add_argument("--region", default="us-east-2")
     p.add_argument("--voice", default=DEFAULT_VOICE)
     p.add_argument("--scenarios", default=None)
+    p.add_argument("--fips", action="store_true",
+                   help="Route AWS calls to the FIPS 140-3 endpoints (runtime-fips). OFF "
+                        "by default. Selects AWS endpoints only — says nothing about the "
+                        "container's own crypto.")
     p.add_argument("--list", action="store_true")
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args()
@@ -297,7 +302,10 @@ def main() -> int:
     if not args.endpoint:
         p.error("endpoint is required unless --list")
 
-    rt = boto3.client("sagemaker-runtime", region_name=args.region)
+    rt = boto3.client("sagemaker-runtime", region_name=args.region,
+                      config=BotoConfig(use_fips_endpoint=True) if args.fips else None)
+    print(f"Runtime URL: {rt.meta.endpoint_url}")
+    print(f"FIPS:        {'yes' if '-fips.' in rt.meta.endpoint_url else 'no'}")
     rows = []
     for name in select_scenarios(list(SCENARIOS), args.scenarios):
         print(f"\n--- {name} ---", flush=True)

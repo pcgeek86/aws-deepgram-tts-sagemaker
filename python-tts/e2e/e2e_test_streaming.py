@@ -213,6 +213,7 @@ def _stress_cmd(
     extra: dict[str, str],
     skip_verify: bool = False,
     barge_in_after_s: float | None = None,
+    fips: bool = False,
 ) -> list[str]:
     cmd = [
         "uv", "run", "--project", str(script.parent),
@@ -227,6 +228,8 @@ def _stress_cmd(
         "--duration", "120",  # generous safety cap; --once stops first
         "--log-level", "WARNING",
     ]
+    if fips:
+        cmd.append("--fips")
     if skip_verify:
         cmd.append("--skip-verify")
     if barge_in_after_s is not None:
@@ -248,6 +251,7 @@ def run_scenario(
     log_dir: Path,
     subprocess_timeout_s: int,
     skip_verify: bool = False,
+    fips: bool = False,
 ) -> dict:
     eff_voice = scenario.voice or voice
     text_file = multi_text_file if scenario.multi_phrase else single_text_file
@@ -260,6 +264,7 @@ def run_scenario(
         scenario.connections, summary_path, text_file, scenario.extra,
         skip_verify=skip_verify,
         barge_in_after_s=scenario.barge_in_after_s,
+        fips=fips,
     )
     logger.info(f"[{scenario.name}] running: {' '.join(cmd)}")
 
@@ -398,6 +403,11 @@ def _make_parser() -> argparse.ArgumentParser:
                    help="Fixture + log directory (default: /tmp/dg-sagemaker-e2e/tts-streaming/<ts>)")
     p.add_argument("--scenarios", default="", metavar="NAME,NAME,...",
                    help="Comma-separated subset of scenario names (default: all). See --list.")
+    p.add_argument("--fips", action="store_true",
+                   help="Route AWS calls to the FIPS 140-3 endpoints (control plane "
+                        "api-fips, bidi streaming runtime-fips...:8443). OFF by default. "
+                        "Selects AWS endpoints only — says nothing about the container's "
+                        "own crypto.")
     p.add_argument("--list", action="store_true", help="List scenarios and exit")
     p.add_argument("--subprocess-timeout-s", type=int, default=120,
                    help="Per-scenario subprocess timeout (default: 120)")
@@ -488,6 +498,7 @@ def main() -> int:
     print("=" * 80)
     print(f"Endpoint:    {args.endpoint_name}")
     print(f"Region:      {args.region}")
+    print(f"FIPS:        {'yes (--fips)' if args.fips else 'no'}")
     print(f"Language:    {language}")
     print(f"Voice:       {voice}")
     print(f"Workdir:     {workdir}")
@@ -510,6 +521,7 @@ def main() -> int:
             scenario,
             endpoint=args.endpoint_name,
             region=args.region,
+            fips=args.fips,
             voice=voice,
             stress_script=stress_script,
             single_text_file=single_text_file,

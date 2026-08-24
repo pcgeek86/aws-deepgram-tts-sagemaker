@@ -49,12 +49,20 @@ DEFAULT_VOICE = "flux-alexis-en"
 BIDI_PORT = 8443
 
 
-def bidi_endpoint_uri(region: str) -> str:
-    """The SageMaker runtime URI for bidirectional streaming (port 8443)."""
-    return f"https://runtime.sagemaker.{region}.amazonaws.com:{BIDI_PORT}"
+def bidi_endpoint_uri(region: str, fips: bool = False) -> str:
+    """The SageMaker runtime URI for bidirectional streaming (port 8443).
+
+    `fips` selects the FIPS 140-3 runtime host. Port 8443 IS served there —
+    verified 2026-08-20 in us-west-2 — which was the open question, since
+    nothing in the AWS docs states that bidi streaming is available on the FIPS
+    endpoint at all. This selects the AWS endpoint only and says nothing about
+    the container's own crypto.
+    """
+    host = "runtime-fips" if fips else "runtime"
+    return f"https://{host}.sagemaker.{region}.amazonaws.com:{BIDI_PORT}"
 
 
-def make_client(region: str) -> SageMakerRuntimeHTTP2Client:
+def make_client(region: str, fips: bool = False) -> SageMakerRuntimeHTTP2Client:
     """Build the HTTP/2 SageMaker runtime client used for bidi streaming.
 
     Credentials come from the ENVIRONMENT, not the shared config file — the
@@ -79,7 +87,7 @@ def make_client(region: str) -> SageMakerRuntimeHTTP2Client:
     # pinned version. Matches `python-flux/flux_stress.py`.
     return SageMakerRuntimeHTTP2Client(
         config=Config(
-            endpoint_uri=bidi_endpoint_uri(region),
+            endpoint_uri=bidi_endpoint_uri(region, fips),
             region=region,
             aws_credentials_identity_resolver=EnvironmentCredentialsResolver(),
             auth_scheme_resolver=HTTPAuthSchemeResolver(),
