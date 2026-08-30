@@ -141,6 +141,7 @@ my-flux-endpoint-dev     Creating   2026-03-10 08:00:13   2026-03-10 08:00:13
 | `--reconfigure-after SECONDS` | *(off)* | Send one mid-stream `Configure` after N seconds (with the `--reconfigure-*` values below) — exercises `ConfigureSuccess`/`ConfigureFailure` |
 | `--reconfigure-eot-threshold` / `--reconfigure-eager-eot-threshold` / `--reconfigure-eot-timeout-ms` / `--reconfigure-keyterms` / `--reconfigure-language-hints` | *(none)* | Values applied in the mid-stream `Configure` |
 | `--region REGION` | `us-east-1` | AWS region |
+| `--skip-verify` | *(off)* | Skip the `DescribeEndpoint` != `InService` pre-flight check (e.g. blue/green `Updating`) |
 | `--loop` | *(off)* | Loop the WAV file continuously |
 | `--duration SECONDS` | *(until file ends)* | Stop automatically after N seconds |
 | `--log-level LEVEL` | `INFO` | DEBUG / INFO / WARNING / ERROR / CRITICAL |
@@ -206,6 +207,7 @@ uv run flux_stress.py file my-flux-endpoint \
 | `--eot-timeout-ms 500-10000` | `5000` (server default) | Max silence before forced EndOfTurn |
 | `--keyterms TERM1,TERM2` | *(none)* | Comma-separated keyterms for recognition boosting |
 | `--region REGION` | `us-east-1` | AWS region |
+| `--skip-verify` | *(off)* | Skip the `DescribeEndpoint` != `InService` pre-flight check (e.g. blue/green `Updating`) |
 | `--duration SECONDS` | *(until Ctrl+C)* | Stop automatically after N seconds |
 | `--log-level LEVEL` | `INFO` | DEBUG / INFO / WARNING / ERROR / CRITICAL |
 

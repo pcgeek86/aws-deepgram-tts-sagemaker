@@ -48,7 +48,7 @@ import wave
 from queue import Queue
 from urllib.parse import quote
 import boto3
-from botocore.exceptions import NoCredentialsError, PartialCredentialsError
+from botocore.exceptions import ClientError, NoCredentialsError, PartialCredentialsError
 from aws_sdk_sagemaker_runtime_http2.client import SageMakerRuntimeHTTP2Client
 from aws_sdk_sagemaker_runtime_http2.config import Config, HTTPAuthSchemeResolver
 from aws_sdk_sagemaker_runtime_http2.models import (
@@ -777,6 +777,38 @@ class BaseFluxClient:
         self.client = SageMakerRuntimeHTTP2Client(config=config)
         logger.info("SageMaker client initialized")
 
+    def verify_endpoint(self):
+        """
+        Verify the SageMaker endpoint exists and is InService before opening any
+        bidirectional streams.
+
+        Flux's ``invoke_endpoint_with_bidirectional_stream`` does not fail fast
+        when the endpoint is missing from the target region — the HTTP/2 stream
+        open simply wedges. A cheap DescribeEndpoint pre-flight turns that silent
+        hang into a clear error (e.g. wrong --region).
+
+        Raises:
+            RuntimeError: If the endpoint does not exist or is not InService.
+        """
+        sm_client = boto3.Session(region_name=self.region).client("sagemaker")
+        try:
+            response = sm_client.describe_endpoint(EndpointName=self.endpoint_name)
+        except ClientError as e:
+            error_code = e.response["Error"]["Code"]
+            if error_code == "ValidationException":
+                raise RuntimeError(
+                    f"Endpoint '{self.endpoint_name}' does not exist in region '{self.region}'"
+                ) from e
+            raise
+
+        status = response.get("EndpointStatus")
+        if status != "InService":
+            raise RuntimeError(
+                f"Endpoint '{self.endpoint_name}' is not ready (status: {status})"
+            )
+
+        logger.info(f"Endpoint '{self.endpoint_name}' is InService")
+
     async def initialize_connections(
         self,
         model: str = DEFAULT_MODEL,
@@ -1365,6 +1397,14 @@ def _add_common_args(parser: argparse.ArgumentParser):
         help="Stop automatically after this many seconds (default: run until Ctrl+C)",
     )
     parser.add_argument(
+        "--skip-verify",
+        action="store_true",
+        help="Skip the DescribeEndpoint != InService pre-flight check. Use this "
+             "when the endpoint is in Updating status but the old variant is still "
+             "serving traffic (SageMaker blue/green); the stream open will fail on "
+             "its own if the endpoint truly isn't reachable.",
+    )
+    parser.add_argument(
         "--log-level",
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
@@ -1521,6 +1561,17 @@ async def run_file(args) -> int:
         num_connections=args.connections,
     )
 
+    # Fail fast on a missing/not-ready endpoint (e.g. wrong --region) instead of
+    # wedging in the bidirectional-stream open.
+    if not args.skip_verify:
+        try:
+            client.verify_endpoint()
+        except (RuntimeError, ClientError, NoCredentialsError, PartialCredentialsError) as e:
+            print(f"ERROR: {e}")
+            return 1
+    else:
+        logger.info(f"Skipping endpoint verification (--skip-verify) for '{args.endpoint_name}'")
+
     # Validate + load the WAV once before printing the banner.
     try:
         client.load_audio()
@@ -1664,6 +1715,17 @@ async def run_microphone(args) -> int:
         sample_rate=args.sample_rate,
         device_index=args.device,
     )
+
+    # Fail fast on a missing/not-ready endpoint (e.g. wrong --region) instead of
+    # wedging in the bidirectional-stream open.
+    if not args.skip_verify:
+        try:
+            client.verify_endpoint()
+        except (RuntimeError, ClientError, NoCredentialsError, PartialCredentialsError) as e:
+            print(f"ERROR: {e}")
+            return 1
+    else:
+        logger.info(f"Skipping endpoint verification (--skip-verify) for '{args.endpoint_name}'")
 
     limit_str = f"{args.duration}s" if args.duration else "until Ctrl+C"
 
